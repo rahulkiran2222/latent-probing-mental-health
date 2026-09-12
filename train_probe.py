@@ -2,39 +2,1061 @@ from pathlib import Path
 import json
 import random
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
-import joblib
 
 from datasets import load_dataset
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
 
 
 # ============================================================
-# Configuration
+# PROJECT CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "google/gemma-2-2b"
 
-# Competition specification
+# Official Project 2 representation
 TARGET_LAYER = 23
 MAX_LENGTH = 64
 
 # Reproducibility
 SEED = 42
 
-# Files produced by this script
+# Dataset used for local probe training
+DATASET_NAME = "ourafla/Mental-Health_Text-Classification_Dataset"
+DATASET_FILE = "mental_heath_unbanlanced.csv"
+
+# Files
 BASE_DIR = Path(__file__).resolve().parent
+
 MODEL_PATH = BASE_DIR / "trained_probe.joblib"
 REPORT_PATH = BASE_DIR / "probe_report.json"
 
+TRAIN_EMBEDDINGS_PATH = BASE_DIR / "train_layer23_embeddings.npz"
+VAL_EMBEDDINGS_PATH = BASE_DIR / "val_layer23_embeddings.npz"
 
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+# ============================================================
+# LOAD DATASET
+# ============================================================
+
+def load_training_data():
+    print("=" * 70)
+    print("LOADING TRAINING DATA")
+    print("=" * 70)
+
+    dataset = load_dataset(
+        DATASET_NAME,
+        data_files=DATASET_FILE
+    )
+
+    # Get the first available split
+    if "train" in dataset:
+        df = dataset["train"].to_pandas()
+    else:
+        split_name = list(dataset.keys())[0]
+        df = dataset[split_name].to_pandas()
+
+    print(f"Dataset shape: {df.shape}")
+    print(f"Columns: {list(df.columns)}")
+
+    # --------------------------------------------------------
+    # Find text column
+    # --------------------------------------------------------
+
+    text_candidates = [
+        "text",
+        "Text",
+        "sentence",
+        "Sentence",
+        "content",
+        "Content",
+        "statement",
+        "Statement"
+    ]
+
+    text_column = None
+
+    for column in text_candidates:
+        if column in df.columns:
+            text_column = column
+            break
+
+    if text_column is None:
+
+        string_columns = df.select_dtypes(
+            include=["object", "string"]
+        ).columns.tolist()
+
+        if not string_columns:
+            raise ValueError(
+                "Could not identify a text column."
+            )
+
+        text_column = string_columns[0]
+
+    # --------------------------------------------------------
+    # Find label column
+    # --------------------------------------------------------
+
+    label_candidates = [
+        "label",
+        "Label",
+        "status",
+        "Status",
+        "class",
+        "Class",
+        "category",
+        "Category"
+    ]
+
+    label_column = None
+
+    for column in label_candidates:
+        if column in df.columns:
+            label_column = column
+            break
+
+    if label_column is None:
+
+        # Try the last column as fallback
+        label_column = df.columns[-1]
+
+    print(f"Text column : {text_column}")
+    print(f"Label column: {label_column}")
+
+    df = df[
+        [text_column, label_column]
+    ].copy()
+
+    df.columns = [
+        "text",
+        "label"
+    ]
+
+    # Remove missing values
+    df = df.dropna()
+
+    df["text"] = df["text"].astype(str)
+
+    # Remove empty strings
+    df = df[
+        df["text"].str.strip().str.len() > 0
+    ]
+
+    # --------------------------------------------------------
+    # Label conversion
+    #
+    # Project 2:
+    #
+    # 0 = normal
+    # 1 = mental health distress
+    #
+    # The source dataset contains a Normal class and
+    # mental-health-related classes.
+    # --------------------------------------------------------
+
+    def convert_label(value):
+
+        value_string = str(value).strip().lower()
+
+        # Explicit normal labels
+        normal_labels = {
+            "normal",
+            "normal text",
+            "non-mental-health",
+            "non mental health",
+            "nonmentalhealth",
+            "non mental-health",
+            "healthy",
+            "none"
+        }
+
+        if value_string in normal_labels:
+            return 0
+
+        # Explicit binary labels
+        if value_string in {
+            "0",
+            "0.0"
+        }:
+            return 0
+
+        if value_string in {
+            "1",
+            "1.0"
+        }:
+            return 1
+
+        # All other mental-health categories
+        # are treated as distress.
+        return 1
+
+    df["label"] = df["label"].apply(convert_label)
+
+    print("\nLabel distribution:")
+    print(
+        df["label"]
+        .value_counts()
+        .sort_index()
+    )
+
+    print(
+        f"\nFinal usable examples: {len(df)}"
+    )
+
+    return df
+
+
+# ============================================================
+# LOAD GEMMA
+# ============================================================
+
+def load_gemma():
+
+    print("\n" + "=" * 70)
+    print("LOADING GEMMA 2 2B")
+    print("=" * 70)
+
+    from transformers import (
+        AutoModel,
+        AutoTokenizer
+    )
+
+    if torch.cuda.is_available():
+
+        device = torch.device("cuda")
+
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0)
+        )
+
+        print(
+            "CUDA memory:",
+            round(
+                torch.cuda.get_device_properties(0).total_memory
+                / 1024**3,
+                2
+            ),
+            "GB"
+        )
+
+        dtype = torch.float16
+
+    else:
+
+        device = torch.device("cpu")
+
+        print("WARNING: CUDA is not available.")
+        print("CPU inference will be very slow.")
+
+        dtype = torch.float32
+
+    print("Device:", device)
+    print("Model:", MODEL_NAME)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME
+    )
+
+    # Gemma may not define a padding token.
+    if tokenizer.pad_token is None:
+
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModel.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=dtype
+    )
+
+    model.to(device)
+    model.eval()
+
+    model.config.pad_token_id = (
+        tokenizer.pad_token_id
+    )
+
+    print(
+        "Hidden size:",
+        model.config.hidden_size
+    )
+
+    print(
+        "Number of hidden states expected:",
+        model.config.num_hidden_layers + 1
+    )
+
+    print(
+        "Target hidden state:",
+        TARGET_LAYER
+    )
+
+    return tokenizer, model, device
+
+
+# ============================================================
+# EXTRACT GEMMA LAYER 23 EMBEDDINGS
+# ============================================================
+
+def extract_embeddings(
+    texts,
+    tokenizer,
+    model,
+    device,
+    cache_path,
+    batch_size=8
+):
+
+    # --------------------------------------------------------
+    # Use cached embeddings if available
+    # --------------------------------------------------------
+
+    if cache_path.exists():
+
+        print(
+            f"\nLoading cached embeddings:"
+            f"\n{cache_path}"
+        )
+
+        data = np.load(cache_path)
+
+        embeddings = data["embeddings"]
+
+        print(
+            "Cached shape:",
+            embeddings.shape
+        )
+
+        return embeddings
+
+    print("\n" + "=" * 70)
+    print("EXTRACTING GEMMA LAYER 23 EMBEDDINGS")
+    print("=" * 70)
+
+    print(
+        "Number of texts:",
+        len(texts)
+    )
+
+    print(
+        "Layer:",
+        TARGET_LAYER
+    )
+
+    print(
+        "Maximum tokens:",
+        MAX_LENGTH
+    )
+
+    print(
+        "Pooling: mean over valid tokens"
+    )
+
+    print(
+        "Batch size:",
+        batch_size
+    )
+
+    hidden_size = model.config.hidden_size
+
+    embeddings = np.zeros(
+        (
+            len(texts),
+            hidden_size
+        ),
+        dtype=np.float32
+    )
+
+    with torch.no_grad():
+
+        for start in range(
+            0,
+            len(texts),
+            batch_size
+        ):
+
+            end = min(
+                start + batch_size,
+                len(texts)
+            )
+
+            batch_texts = texts[start:end]
+
+            encoded = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=MAX_LENGTH,
+                return_tensors="pt"
+            )
+
+            encoded = {
+                key: value.to(device)
+                for key, value in encoded.items()
+            }
+
+            outputs = model(
+                **encoded,
+                output_hidden_states=True
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT
+            #
+            # Project 2 uses Layer 23.
+            #
+            # hidden_states[23] is the representation used
+            # here, following the competition specification.
+            # ------------------------------------------------
+
+            hidden = outputs.hidden_states[
+                TARGET_LAYER
+            ]
+
+            # ------------------------------------------------
+            # Mean pooling over VALID tokens only
+            # ------------------------------------------------
+
+            attention_mask = (
+                encoded["attention_mask"]
+            )
+
+            mask = attention_mask.unsqueeze(
+                -1
+            ).to(
+                hidden.dtype
+            )
+
+            masked_hidden = (
+                hidden * mask
+            )
+
+            summed = masked_hidden.sum(
+                dim=1
+            )
+
+            token_counts = mask.sum(
+                dim=1
+            ).clamp(
+                min=1
+            )
+
+            pooled = (
+                summed / token_counts
+            )
+
+            pooled = (
+                pooled
+                .float()
+                .cpu()
+                .numpy()
+            )
+
+            embeddings[
+                start:end
+            ] = pooled
+
+            processed = end
+            percent = (
+                100.0
+                * processed
+                / len(texts)
+            )
+
+            print(
+                f"Progress: "
+                f"{processed}/{len(texts)} "
+                f"({percent:.1f}%)"
+            )
+
+    # --------------------------------------------------------
+    # Save cache
+    # --------------------------------------------------------
+
+    np.savez_compressed(
+        cache_path,
+        embeddings=embeddings
+    )
+
+    print(
+        "\nSaved embeddings:",
+        cache_path
+    )
+
+    print(
+        "Embedding shape:",
+        embeddings.shape
+    )
+
+    return embeddings
+
+
+# ============================================================
+# TRAIN CANDIDATE PROBES
+# ============================================================
+
+def train_candidates(
+    X_train,
+    y_train,
+    X_val,
+    y_val
+):
+
+    print("\n" + "=" * 70)
+    print("TRAINING LINEAR PROBES")
+    print("=" * 70)
+
+    candidates = []
+
+    # --------------------------------------------------------
+    # Linear SVM candidates
+    # --------------------------------------------------------
+
+    svm_c_values = [
+        0.001,
+        0.003,
+        0.01,
+        0.03,
+        0.1,
+        0.3,
+        1.0,
+        3.0,
+        10.0
+    ]
+
+    for C in svm_c_values:
+
+        for class_weight in [
+            None,
+            "balanced"
+        ]:
+
+            name = (
+                f"LinearSVC "
+                f"C={C} "
+                f"class_weight={class_weight}"
+            )
+
+            model = Pipeline([
+                (
+                    "scaler",
+                    StandardScaler()
+                ),
+                (
+                    "classifier",
+                    LinearSVC(
+                        C=C,
+                        class_weight=class_weight,
+                        max_iter=20000,
+                        dual="auto",
+                        random_state=SEED
+                    )
+                )
+            ])
+
+            candidates.append(
+                (
+                    name,
+                    model
+                )
+            )
+
+    # --------------------------------------------------------
+    # Logistic Regression candidates
+    # --------------------------------------------------------
+
+    logistic_c_values = [
+        0.001,
+        0.003,
+        0.01,
+        0.03,
+        0.1,
+        0.3,
+        1.0,
+        3.0,
+        10.0
+    ]
+
+    for C in logistic_c_values:
+
+        name = (
+            f"LogisticRegression C={C}"
+        )
+
+        model = Pipeline([
+            (
+                "scaler",
+                StandardScaler()
+            ),
+            (
+                "classifier",
+                LogisticRegression(
+                    C=C,
+                    max_iter=5000,
+                    solver="liblinear",
+                    class_weight=None,
+                    random_state=SEED
+                )
+            )
+        ])
+
+        candidates.append(
+            (
+                name,
+                model
+            )
+        )
+
+    # --------------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------------
+
+    results = []
+
+    best_model = None
+    best_name = None
+    best_accuracy = -1.0
+
+    for name, model in candidates:
+
+        print(
+            f"\nTraining: {name}"
+        )
+
+        try:
+
+            model.fit(
+                X_train,
+                y_train
+            )
+
+            predictions = model.predict(
+                X_val
+            )
+
+            accuracy = accuracy_score(
+                y_val,
+                predictions
+            )
+
+            print(
+                f"Validation accuracy: "
+                f"{accuracy:.5f}"
+            )
+
+            result = {
+                "model": name,
+                "accuracy": float(
+                    accuracy
+                )
+            }
+
+            results.append(result)
+
+            if accuracy > best_accuracy:
+
+                best_accuracy = accuracy
+                best_model = model
+                best_name = name
+
+        except Exception as error:
+
+            print(
+                "FAILED:",
+                name
+            )
+
+            print(
+                "Reason:",
+                error
+            )
+
+    # --------------------------------------------------------
+    # Sort results
+    # --------------------------------------------------------
+
+    results.sort(
+        key=lambda item: item["accuracy"],
+        reverse=True
+    )
+
+    print("\n" + "=" * 70)
+    print("TOP VALIDATION RESULTS")
+    print("=" * 70)
+
+    for result in results[:10]:
+
+        print(
+            f"{result['accuracy']:.5f}"
+            f"  ->  "
+            f"{result['model']}"
+        )
+
+    print("\n" + "=" * 70)
+    print("BEST MODEL")
+    print("=" * 70)
+
+    print(
+        "Model:",
+        best_name
+    )
+
+    print(
+        "Validation accuracy:",
+        f"{best_accuracy:.5f}"
+    )
+
+    return (
+        best_model,
+        best_name,
+        best_accuracy,
+        results
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print(
+        "PROJECT 2"
+    )
+    print(
+        "LATENT PROBING FOR MENTAL HEALTH "
+        "SENTIMENT CLASSIFICATION"
+    )
+    print("=" * 70)
+
+    print()
+    print(
+        "Model: Gemma 2 2B"
+    )
+    print(
+        "Official representation: Layer 23"
+    )
+    print(
+        "Pooling: mean pooling"
+    )
+    print(
+        "Maximum tokens: 64"
+    )
+    print(
+        "Target: 0 = normal, "
+        "1 = mental-health distress"
+    )
+    print()
+
+    # ========================================================
+    # 1. Load data
+    # ========================================================
+
+    df = load_training_data()
+
+    texts = df[
+        "text"
+    ].tolist()
+
+    labels = df[
+        "label"
+    ].to_numpy(
+        dtype=np.int64
+    )
+
+    # ========================================================
+    # 2. Train/validation split
+    # ========================================================
+
+    (
+        train_texts,
+        val_texts,
+        y_train,
+        y_val
+    ) = train_test_split(
+        texts,
+        labels,
+        test_size=0.20,
+        random_state=SEED,
+        stratify=labels
+    )
+
+    print("\n" + "=" * 70)
+    print("TRAIN / VALIDATION SPLIT")
+    print("=" * 70)
+
+    print(
+        "Training examples:",
+        len(train_texts)
+    )
+
+    print(
+        "Validation examples:",
+        len(val_texts)
+    )
+
+    print(
+        "Training label distribution:",
+        np.bincount(y_train)
+    )
+
+    print(
+        "Validation label distribution:",
+        np.bincount(y_val)
+    )
+
+    # ========================================================
+    # 3. Load Gemma
+    # ========================================================
+
+    tokenizer, model, device = load_gemma()
+
+    # ========================================================
+    # 4. Extract training embeddings
+    # ========================================================
+
+    batch_size = 8 if torch.cuda.is_available() else 2
+
+    X_train = extract_embeddings(
+        texts=train_texts,
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        cache_path=TRAIN_EMBEDDINGS_PATH,
+        batch_size=batch_size
+    )
+
+    # ========================================================
+    # 5. Extract validation embeddings
+    # ========================================================
+
+    X_val = extract_embeddings(
+        texts=val_texts,
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        cache_path=VAL_EMBEDDINGS_PATH,
+        batch_size=batch_size
+    )
+
+    # ========================================================
+    # 6. Train candidate probes
+    # ========================================================
+
+    (
+        best_model,
+        best_name,
+        best_accuracy,
+        results
+    ) = train_candidates(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val
+    )
+
+    # ========================================================
+    # 7. Retrain best probe on ALL available data
+    # ========================================================
+
+    print("\n" + "=" * 70)
+    print("RETRAINING BEST PROBE ON ALL DATA")
+    print("=" * 70)
+
+    X_all = np.concatenate(
+        [
+            X_train,
+            X_val
+        ],
+        axis=0
+    )
+
+    y_all = np.concatenate(
+        [
+            y_train,
+            y_val
+        ],
+        axis=0
+    )
+
+    print(
+        "Final training shape:",
+        X_all.shape
+    )
+
+    best_model.fit(
+        X_all,
+        y_all
+    )
+
+    # ========================================================
+    # 8. Save trained probe
+    # ========================================================
+
+    joblib.dump(
+        best_model,
+        MODEL_PATH
+    )
+
+    print(
+        "\nSaved trained probe:"
+    )
+
+    print(
+        MODEL_PATH
+    )
+
+    # ========================================================
+    # 9. Save experiment report
+    # ========================================================
+
+    report = {
+        "project": (
+            "Latent Probing for Mental Health "
+            "Sentiment Classification"
+        ),
+        "model": MODEL_NAME,
+        "layer": TARGET_LAYER,
+        "pooling": (
+            "mean_pool_all_valid_tokens"
+        ),
+        "max_length": MAX_LENGTH,
+        "seed": SEED,
+        "dataset": DATASET_NAME,
+        "dataset_file": DATASET_FILE,
+        "total_examples": int(
+            len(df)
+        ),
+        "train_examples": int(
+            len(train_texts)
+        ),
+        "validation_examples": int(
+            len(val_texts)
+        ),
+        "best_model": best_name,
+        "validation_accuracy": float(
+            best_accuracy
+        ),
+        "label_mapping": {
+            "0": "normal",
+            "1": "mental_health_distress"
+        },
+        "results": results
+    }
+
+    with open(
+        REPORT_PATH,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            report,
+            file,
+            indent=2
+        )
+
+    print(
+        "Saved experiment report:"
+    )
+
+    print(
+        REPORT_PATH
+    )
+
+    # ========================================================
+    # 10. Final summary
+    # ========================================================
+
+    print("\n" + "=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Model:               {MODEL_NAME}"
+    )
+
+    print(
+        f"Layer:               {TARGET_LAYER}"
+    )
+
+    print(
+        f"Pooling:             mean"
+    )
+
+    print(
+        f"Maximum tokens:      {MAX_LENGTH}"
+    )
+
+    print(
+        f"Examples:            {len(df)}"
+    )
+
+    print(
+        f"Best probe:          {best_name}"
+    )
+
+    print(
+        f"Validation accuracy: "
+        f"{best_accuracy:.5f}"
+    )
+
+    print()
+    print(
+        "Generated files:"
+    )
+
+    print(
+        f"  {MODEL_PATH.name}"
+    )
+
+    print(
+        f"  {REPORT_PATH.name}"
+    )
+
+    print()
+    print(
+        "Embedding cache files:"
+    )
+
+    print(
+        f"  {TRAIN_EMBEDDINGS_PATH.name}"
+    )
+
+    print(
+        f"  {VAL_EMBEDDINGS_PATH.name}"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
 # ============================================================
 # Reproducibility
 # ============================================================
